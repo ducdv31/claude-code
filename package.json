@@ -37,7 +37,7 @@
     "chokidar": "^4.0.3",
     "cli-boxes": "^3.0.0",
     "code-excerpt": "^4.0.0",
-    "diff": "^7.0.0",
+    "diff": "8.0.3",
     "emoji-regex": "^10.4.0",
     "env-paths": "^3.0.0",
     "execa": "^9.5.2",
