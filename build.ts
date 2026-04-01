@@ -4,13 +4,12 @@
  * Run: bun run build.ts
  */
 import type { BunPlugin } from 'bun'
-import { existsSync } from 'fs'
+import { existsSync, mkdirSync } from 'fs'
+import { unlink } from 'fs/promises'
 import * as path from 'path'
 
 // ---------------------------------------------------------------------------
-// Feature flags — controls dead-code elimination at bundle time.
-// Set to `true` to include the feature, `false` to strip it out.
-// Flags that depend on private Anthropic packages (@ant/*) must stay false.
+// Feature flags
 // ---------------------------------------------------------------------------
 const features: Record<string, boolean> = {
   ABLATION_BASELINE: false,
@@ -29,15 +28,15 @@ const features: Record<string, boolean> = {
   BUILDING_CLAUDE_APPS: false,
   BUILTIN_EXPLORE_PLAN_AGENTS: true,
   BYOC_ENVIRONMENT_RUNNER: false,
-  CACHED_MICROCOMPACT: false,   // cachedMicrocompact.ts not in this repo
+  CACHED_MICROCOMPACT: false,
   CCR_AUTO_CONNECT: false,
   CCR_MIRROR: false,
   CCR_REMOTE_SETUP: false,
-  CHICAGO_MCP: false,           // requires private @ant/computer-use-mcp
-  COMMIT_ATTRIBUTION: false,    // attributionTrailer.ts not in this repo
+  CHICAGO_MCP: false,
+  COMMIT_ATTRIBUTION: false,
   COMPACTION_REMINDERS: true,
-  CONNECTOR_TEXT: false,        // types/connectorText.ts not in this repo
-  CONTEXT_COLLAPSE: false,      // services/contextCollapse not in this repo
+  CONNECTOR_TEXT: false,
+  CONTEXT_COLLAPSE: false,
   COORDINATOR_MODE: false,
   COWORKER_TYPE_TELEMETRY: false,
   DAEMON: false,
@@ -47,7 +46,7 @@ const features: Record<string, boolean> = {
   ENHANCED_TELEMETRY_BETA: false,
   EXPERIMENTAL_SKILL_SEARCH: false,
   EXTRACT_MEMORIES: true,
-  FILE_PERSISTENCE: false,      // utils/filePersistence/types.ts not in this repo
+  FILE_PERSISTENCE: false,
   FORK_SUBAGENT: false,
   HARD_FAIL: false,
   HISTORY_PICKER: true,
@@ -55,7 +54,7 @@ const features: Record<string, boolean> = {
   HOOK_PROMPTS: false,
   IS_LIBC_GLIBC: false,
   IS_LIBC_MUSL: false,
-  KAIROS: false,                // requires private assistant module
+  KAIROS: false,
   KAIROS_BRIEF: false,
   KAIROS_CHANNELS: false,
   KAIROS_DREAM: false,
@@ -75,7 +74,7 @@ const features: Record<string, boolean> = {
   POWERSHELL_AUTO_MODE: false,
   PROMPT_CACHE_BREAK_DETECTION: false,
   QUICK_SEARCH: true,
-  REACTIVE_COMPACT: false,      // services/compact/reactiveCompact.ts not in this repo
+  REACTIVE_COMPACT: false,
   REVIEW_ARTIFACT: false,
   RUN_SKILL_GENERATOR: false,
   SELF_HOSTED_RUNNER: false,
@@ -98,97 +97,174 @@ const features: Record<string, boolean> = {
   UNATTENDED_RETRY: false,
   UPLOAD_USER_SETTINGS: false,
   VERIFICATION_AGENT: false,
-  VOICE_MODE: false,            // requires voice hardware/private packages
-  WEB_BROWSER_TOOL: false,     // requires private @ant/claude-for-chrome-mcp
-  WORKFLOW_SCRIPTS: false,     // tools/WorkflowTool not in this repo
+  VOICE_MODE: false,
+  WEB_BROWSER_TOOL: false,
+  WORKFLOW_SCRIPTS: false,
 }
 
 // ---------------------------------------------------------------------------
-// Plugin 1: Feature flags
-// Replaces feature('FLAG') → true/false in source text before Bun parses it,
-// enabling proper tree-shaking of dead branches.
-// Also stubs out the bun:bundle virtual import.
+// Pre-build: scan all source files, find missing imports, create stub files.
+// This avoids using onResolve in a Bun plugin (which crashes Bun 1.3.11).
+// ---------------------------------------------------------------------------
+const srcRoot = path.resolve('./src')
+
+function resolvedFileExists(base: string): boolean {
+  if (existsSync(base)) return true
+  for (const ext of ['.ts', '.tsx', '/index.ts', '/index.tsx', '.js', '/index.js']) {
+    if (existsSync(base + ext)) return true
+  }
+  // TypeScript ESM: import ends in .js/.jsx but real file is .ts/.tsx
+  for (const jsExt of ['.js', '.jsx']) {
+    if (base.endsWith(jsExt)) {
+      const noExt = base.slice(0, -jsExt.length)
+      if (existsSync(noExt + '.ts')) return true
+      if (existsSync(noExt + '.tsx')) return true
+      if (existsSync(noExt + '/index.ts')) return true
+      if (existsSync(noExt + '/index.tsx')) return true
+    }
+  }
+  return false
+}
+
+/** Determine stub file path from the resolved base path of the import */
+function stubFilePath(base: string, imp: string): string {
+  if (imp.endsWith('.d.ts')) return base
+  if (imp.endsWith('.md'))   return base
+  if (imp.endsWith('.js'))   return base.slice(0, -3)  + '.ts'
+  if (imp.endsWith('.jsx'))  return base.slice(0, -4)  + '.tsx'
+  if (imp.endsWith('.ts') || imp.endsWith('.tsx')) return base
+  return base + '.ts'
+}
+
+/** Generate stub TypeScript source that exports all expected named bindings */
+function makeStubSource(imp: string, namedExports: string[]): string {
+  if (imp.endsWith('.d.ts')) return '// auto-stub\nexport {}\n'
+  if (imp.endsWith('.md'))   return '# stub\n'
+  const lines = [`// auto-stub: ${imp}`]
+  for (const name of namedExports) {
+    // Export each name as a no-op so named import checks pass
+    lines.push(`export const ${name}: any = undefined`)
+  }
+  if (namedExports.length === 0) {
+    lines.push('export default {}')
+  }
+  return lines.join('\n') + '\n'
+}
+
+/** Delete any auto-stub files left by a previous failed build */
+async function cleanOldStubs(): Promise<void> {
+  const glob = new Bun.Glob('**/*.{ts,tsx,d.ts,md}')
+  const marker = '// auto-stub'
+  for await (const rel of glob.scan(srcRoot)) {
+    const filePath = path.join(srcRoot, rel)
+    const content = await Bun.file(filePath).text().catch(() => '')
+    if (content.startsWith(marker) || content.startsWith('# stub')) {
+      await unlink(filePath).catch(() => {})
+    }
+  }
+}
+
+async function createMissingStubs(): Promise<string[]> {
+  const created: string[] = []
+
+  // stubFilePath → set of named exports that importers expect
+  const neededExports = new Map<string, Set<string>>()
+  // stubFilePath → original import string (for stub content)
+  const stubImpMap = new Map<string, string>()
+
+  // Regex patterns
+  const namedImportPat = /import\s*(?:type\s*)?\{\s*([^}]+)\}\s*from\s*['"](\.[^'"]+)['"]/g
+  const allImportPats  = [
+    /(?:from|import)\s+['"](\.[^'"]+)['"]/g,
+    /require\s*\(\s*['"](\.[^'"]+)['"]\s*\)/g,
+    /import\s*\(\s*['"](\.[^'"]+)['"]\s*\)/g,
+  ]
+
+  const glob = new Bun.Glob('**/*.{ts,tsx}')
+  for await (const rel of glob.scan(srcRoot)) {
+    const filePath = path.join(srcRoot, rel)
+    const fileDir  = path.dirname(filePath)
+    const content  = await Bun.file(filePath).text()
+
+    // --- Pass 1: collect named imports from missing modules ---
+    namedImportPat.lastIndex = 0
+    let m: RegExpExecArray | null
+    while ((m = namedImportPat.exec(content)) !== null) {
+      const names = m[1]
+      const imp   = m[2]
+      if (!imp) continue
+      const base = path.resolve(fileDir, imp)
+      if (resolvedFileExists(base)) continue
+
+      const sp = stubFilePath(base, imp)
+      if (!neededExports.has(sp)) neededExports.set(sp, new Set())
+      stubImpMap.set(sp, imp)
+
+      // Parse names: "foo, bar as _bar, type Baz" → ['foo', '_bar']
+      for (const raw of names.split(',')) {
+        const clean = raw.trim().replace(/^type\s+/, '')
+        const alias = clean.split(/\s+as\s+/)
+        const localName = (alias[1] ?? alias[0]).trim()
+        if (localName) neededExports.get(sp)!.add(localName)
+      }
+    }
+
+    // --- Pass 2: collect all missing import paths ---
+    for (const pat of allImportPats) {
+      pat.lastIndex = 0
+      while ((m = pat.exec(content)) !== null) {
+        const imp = m[1]
+        if (!imp) continue
+        const base = path.resolve(fileDir, imp)
+        if (resolvedFileExists(base)) continue
+        const sp = stubFilePath(base, imp)
+        if (!neededExports.has(sp)) neededExports.set(sp, new Set())
+        stubImpMap.set(sp, imp)
+      }
+    }
+  }
+
+  // --- Create stub files ---
+  for (const [sp, names] of neededExports) {
+    if (existsSync(sp)) continue
+    const imp = stubImpMap.get(sp) ?? sp
+    mkdirSync(path.dirname(sp), { recursive: true })
+    await Bun.write(sp, makeStubSource(imp, [...names]))
+    created.push(sp)
+  }
+
+  return created
+}
+
+// ---------------------------------------------------------------------------
+// Plugin: feature flags + bun:bundle shim
+// Only uses onLoad (no onResolve) to avoid Bun 1.3.11 crash.
 // ---------------------------------------------------------------------------
 function createFeatureFlagPlugin(featureMap: Record<string, boolean>): BunPlugin {
   return {
     name: 'feature-flags',
     setup(build) {
-      // Redirect `bun:bundle` to a no-op shim (call sites are already rewritten)
       build.onResolve({ filter: /^bun:bundle$/ }, () => ({
         path: 'bun-bundle-shim',
         namespace: 'virtual',
       }))
 
-      // Replace feature('FLAG') calls with literals before Bun parses the file
-      build.onLoad({ filter: /\.(ts|tsx)$/ }, async (args) => {
-        let contents = await Bun.file(args.path).text()
-        for (const [name, enabled] of Object.entries(featureMap)) {
-          const value = String(enabled)
-          contents = contents.replaceAll(`feature('${name}')`, value)
-          contents = contents.replaceAll(`feature("${name}")`, value)
-        }
-        return { contents, loader: args.path.endsWith('.tsx') ? 'tsx' : 'ts' }
-      })
-    },
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Plugin 2: Virtual / stub modules
-// Handles several categories of unresolvable imports:
-//   a) bun:bundle shim (registered by plugin 1 above)
-//   b) Missing internal source files (not included in this partial repo dump)
-//   c) Type-declaration files (.d.ts) imported at runtime
-//   d) Markdown files imported as text
-// ---------------------------------------------------------------------------
-function createStubPlugin(): BunPlugin {
-  // Candidate extensions to check when a .js extension is used in an import
-  const TS_EXTENSIONS = ['.ts', '.tsx', '/index.ts', '/index.tsx', '.js', '/index.js']
-
-  function fileExistsWithExtensions(base: string): boolean {
-    if (existsSync(base)) return true
-    for (const ext of TS_EXTENSIONS) {
-      if (existsSync(base + ext)) return true
-    }
-    return false
-  }
-
-  return {
-    name: 'stub-missing',
-    setup(build) {
-      // (a) bun:bundle shim content
       build.onLoad({ filter: /.*/, namespace: 'virtual' }, () => ({
         contents: 'export function feature(_name) { return false }',
         loader: 'js',
       }))
 
-      // (b) Stub missing relative imports (internal modules not in this repo)
-      build.onResolve({ filter: /^\./ }, (args) => {
-        // Skip .d.ts type imports — always stub them (no runtime value)
-        if (args.path.endsWith('.d.ts')) {
-          return { path: args.path, namespace: 'stub' }
+      build.onLoad({ filter: /\.(ts|tsx)$/ }, async (args) => {
+        let contents = await Bun.file(args.path).text()
+        for (const [name, enabled] of Object.entries(featureMap)) {
+          const val = String(enabled)
+          contents = contents.replaceAll(`feature('${name}')`, val)
+          contents = contents.replaceAll(`feature("${name}")`, val)
         }
-
-        const baseDir = path.dirname(args.importer)
-        const resolved = path.resolve(baseDir, args.path)
-
-        if (fileExistsWithExtensions(resolved)) {
-          return null // file exists — let Bun resolve it normally
-        }
-
-        // File not found → return empty stub
-        return { path: args.path, namespace: 'stub' }
+        return { contents, loader: args.path.endsWith('.tsx') ? 'tsx' : 'ts' }
       })
 
-      // (c) Stub content for missing internal modules
-      build.onLoad({ filter: /.*/, namespace: 'stub' }, (args) => ({
-        // Export an empty module; named exports default to undefined at runtime.
-        // Most missing modules are either feature-gated (DCE'd) or optional.
-        contents: `// auto-stub: ${args.path}\nexport default {};\n`,
-        loader: 'js',
-      }))
-
-      // (d) Markdown files — import as plain string
+      // Markdown files → string export
       build.onLoad({ filter: /\.md$/ }, async (args) => ({
         contents: `export default ${JSON.stringify(await Bun.file(args.path).text())};`,
         loader: 'js',
@@ -198,27 +274,20 @@ function createStubPlugin(): BunPlugin {
 }
 
 // ---------------------------------------------------------------------------
-// Optional npm packages — dynamically imported, not shipped in this build.
-// Marking them external prevents bundle errors; they fail gracefully at
-// runtime only when the user actually enables the feature.
+// External packages
 // ---------------------------------------------------------------------------
 const externalPackages = [
-  // Private Anthropic internal packages (never on npm)
   '@ant/claude-for-chrome-mcp',
   '@ant/computer-use-input',
   '@ant/computer-use-mcp',
   '@ant/computer-use-swift',
   '@anthropic-ai/mcpb',
   '@anthropic-ai/sandbox-runtime',
-  'color-diff-napi',            // native binary, not on npm
-
-  // Optional cloud provider SDKs (user installs if they use Bedrock/Vertex/etc.)
+  'color-diff-napi',
   '@anthropic-ai/bedrock-sdk',
   '@anthropic-ai/foundry-sdk',
   '@anthropic-ai/vertex-sdk',
   '@azure/identity',
-
-  // Optional OpenTelemetry exporters (user installs if they configure OTLP)
   '@opentelemetry/exporter-metrics-otlp-grpc',
   '@opentelemetry/exporter-metrics-otlp-http',
   '@opentelemetry/exporter-metrics-otlp-proto',
@@ -229,31 +298,30 @@ const externalPackages = [
   '@opentelemetry/exporter-trace-otlp-grpc',
   '@opentelemetry/exporter-trace-otlp-http',
   '@opentelemetry/exporter-trace-otlp-proto',
-
-  // Optional native modules
-  'sharp',                      // image processing (optional)
+  'sharp',
+  'modifiers-napi',
 ]
 
-// ---------------------------------------------------------------------------
-// MACRO.* — dotted-identifier defines, valid in Bun/esbuild define syntax
-// ---------------------------------------------------------------------------
 const macroDefines: Record<string, string> = {
   'MACRO.VERSION': JSON.stringify('1.0.0'),
   'MACRO.BUILD_TIME': JSON.stringify(new Date().toISOString()),
-  'MACRO.FEEDBACK_CHANNEL': JSON.stringify(
-    'https://github.com/anthropics/claude-code/issues',
-  ),
-  'MACRO.ISSUES_EXPLAINER': JSON.stringify(
-    'Report issues at https://github.com/anthropics/claude-code/issues',
-  ),
+  'MACRO.FEEDBACK_CHANNEL': JSON.stringify('https://github.com/anthropics/claude-code/issues'),
+  'MACRO.ISSUES_EXPLAINER': JSON.stringify('Report issues at https://github.com/anthropics/claude-code/issues'),
   'MACRO.NATIVE_PACKAGE_URL': JSON.stringify(''),
   'MACRO.PACKAGE_URL': JSON.stringify('npm:@anthropic-ai/claude-code'),
   'MACRO.VERSION_CHANGELOG': JSON.stringify(''),
 }
 
 // ---------------------------------------------------------------------------
-// Build
+// Main
 // ---------------------------------------------------------------------------
+console.log('Scanning for missing imports and creating stubs...')
+await cleanOldStubs()
+const stubs = await createMissingStubs()
+if (stubs.length > 0) {
+  console.log(`  Created ${stubs.length} stub file(s)`)
+}
+
 console.log('Building Claude Code...')
 console.time('build')
 
@@ -265,13 +333,16 @@ const result = await Bun.build({
   define: macroDefines,
   external: externalPackages,
   naming: 'cli.js',
-  plugins: [
-    createFeatureFlagPlugin(features),
-    createStubPlugin(),
-  ],
+  plugins: [createFeatureFlagPlugin(features)],
 })
 
 console.timeEnd('build')
+
+// Clean up generated stubs
+if (stubs.length > 0) {
+  await Promise.all(stubs.map(s => unlink(s).catch(() => {})))
+  console.log(`  Removed ${stubs.length} stub file(s)`)
+}
 
 if (!result.success) {
   console.error('Build failed:')
@@ -285,7 +356,6 @@ if (!result.success) {
 const distFile = './dist/cli.js'
 const original = await Bun.file(distFile).text()
 await Bun.write(distFile, `#!/usr/bin/env node\n${original}`)
-
 const { execSync } = await import('child_process')
 execSync(`chmod +x ${distFile}`)
 
